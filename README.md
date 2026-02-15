@@ -194,6 +194,7 @@ You can configure the appearance of certain UI elements by setting the following
 
 | Variable                  | Description                            | Values                                                                                       | Default Value |
 |---------------------------|----------------------------------------|----------------------------------------------------------------------------------------------|---------------|
+| `g:WhichKey_Position`     | Position of the popup in the IDE frame | `bottom`, `center`, `top`                                                                    | `bottom`      |
 | `g:WhichKey_Divider`      | String to separate key and description | any string                                                                                   | ` → `         |
 | `g:WhichKey_FontFamily`   | Font to use for the popup              | CSS `font-family` (see [examples](https://www.w3schools.com/cssref/pr_font_font-family.asp)) | `monospace`   |
 | `g:WhichKey_FontSize`     | Font size for the popup                | Font size in `point` (for example `15`, `22`, etc.)                                          | IDE default³  |

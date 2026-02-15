@@ -1,18 +1,21 @@
 package eu.theblob42.idea.whichkey.config
 
 import com.intellij.openapi.editor.colors.EditorColorsManager
-import com.intellij.openapi.ui.popup.Balloon
+import com.intellij.openapi.ui.popup.JBPopup
 import com.intellij.openapi.ui.popup.JBPopupFactory
-import com.intellij.ui.awt.RelativePoint
 import com.maddyhome.idea.vim.api.globalOptions
 import com.maddyhome.idea.vim.api.injector
 import com.maddyhome.idea.vim.vimscript.model.datatypes.VimInt
 import com.maddyhome.idea.vim.vimscript.model.datatypes.VimString
 import eu.theblob42.idea.whichkey.model.Mapping
 import kotlinx.coroutines.*
+import java.awt.Point
+import javax.swing.JEditorPane
 import javax.swing.JFrame
 import javax.swing.JLabel
 import javax.swing.KeyStroke
+import javax.swing.SwingUtilities
+import javax.swing.Timer
 import kotlin.math.ceil
 
 object PopupConfig {
@@ -41,8 +44,31 @@ object PopupConfig {
         else -> option.asString().toBoolean()
     }
 
-    private var currentBalloon: Balloon? = null
-    private var displayBalloonJob: Job? = null
+    // configurable popup position within the IDE frame (center, top, bottom)
+    private const val POSITION_KEY = "WhichKey_Position"
+    private val DEFAULT_POSITION = PopupPosition.BOTTOM
+    private val popupPosition: PopupPosition
+    get() = when (val pos = injector.variableService.getGlobalVariableValue(POSITION_KEY)) {
+        null -> DEFAULT_POSITION
+        !is VimString -> DEFAULT_POSITION
+        else -> PopupPosition.values().firstOrNull { it.name.equals(pos.asString(), ignoreCase = true) } ?: DEFAULT_POSITION
+    }
+
+    // whether the popup should be dismissed when clicking outside of it
+    private const val CANCEL_ON_CLICK_OUTSIDE_KEY = "WhichKey_CancelOnClickOutside"
+    private val cancelOnClickOutside: Boolean
+    get() = when (val option = injector.variableService.getGlobalVariableValue(CANCEL_ON_CLICK_OUTSIDE_KEY)) {
+        null -> true
+        !is VimString -> true
+        else -> option.asString().toBoolean()
+    }
+
+    // the currently displayed popup, null if no popup is visible
+    private var currentPopup: JBPopup? = null
+    // coroutine job for the delayed popup display, allows cancellation before the popup is shown
+    private var displayPopupJob: Job? = null
+    // timer for auto-hiding the popup after the configured timeout (replaces Balloon's built-in fadeout)
+    private var fadeoutTimer: Timer? = null
 
     /**
      * Either cancel the display job or hide the current popup
@@ -50,12 +76,15 @@ object PopupConfig {
     fun hidePopup() {
         // cancel job or wait till it's done (if it already started)
         runBlocking {
-            displayBalloonJob?.cancelAndJoin()
+            displayPopupJob?.cancelAndJoin()
         }
-        // hide Balloon if present and reset value
-        currentBalloon?.let {
-            it.hide()
-            currentBalloon = null
+        // cancel fadeout timer if present
+        fadeoutTimer?.stop()
+        fadeoutTimer = null
+        // hide popup if present and reset value
+        currentPopup?.let {
+            it.cancel()
+            currentPopup = null
         }
     }
 
@@ -128,33 +157,77 @@ object PopupConfig {
             mappingsStringBuilder.append(FormatConfig.formatTypedSequence(typedKeys))
         }
 
-        val target = RelativePoint.getSouthWestOf(ideFrame.rootPane)
         val fadeoutTime = if (injector.globalOptions().timeout) {
             injector.globalOptions().timeoutlen.toLong()
         } else {
             0L
         }
 
-        // the extra variable 'newWhichKeyBalloon' is needed so that the currently displayed Balloon
-        // can be hidden in case the 'displayBalloonJob' gets canceled before execution
-        val newWhichKeyBalloon = JBPopupFactory.getInstance()
-            .createHtmlTextBalloonBuilder(mappingsStringBuilder.toString(), null, EditorColorsManager.getInstance().schemeForCurrentUITheme.defaultBackground, null)
-            .setAnimationCycle(10) // shorten animation time
-            .setFadeoutTime(fadeoutTime)
-            .createBalloon()
-
-        /*
-         * wait for a few ms before showing the Balloon to prevent flickering on fast consecutive key presses
-         * subtract the already passed time (for calculations etc.) to make the delay as consistent as possible
-         */
-        val delay = (defaultPopupDelay - (System.currentTimeMillis() - startTime)).let {
-            if (it < 0) 0 else it
+        // render the HTML content in a non-editable JEditorPane with the theme's background color
+        val bgColor = EditorColorsManager.getInstance().schemeForCurrentUITheme.defaultBackground
+        val editorPane = JEditorPane().apply {
+            contentType = "text/html"
+            isEditable = false
+            background = bgColor
+            text = "<html><body style=\"background-color: #${Integer.toHexString(bgColor.rgb).substring(2)};\">${mappingsStringBuilder}</body></html>"
         }
 
-        displayBalloonJob = GlobalScope.launch {
+        val position = popupPosition
+
+        // create a lightweight JBPopup (no focus steal, with border, dismissible on click)
+        val newPopup = JBPopupFactory.getInstance()
+            .createComponentPopupBuilder(editorPane, null)
+            .setRequestFocus(false)
+            .setCancelOnClickOutside(cancelOnClickOutside)
+            .setShowBorder(true)
+            .createPopup()
+
+        /*
+         * wait for a few ms before showing the popup to prevent flickering on fast consecutive key presses
+         * subtract the already passed time (for calculations etc.) to make the delay as consistent as possible
+         */
+        val delay = (defaultPopupDelay - (System.currentTimeMillis() - startTime)).coerceAtLeast(0)
+
+        displayPopupJob = GlobalScope.launch {
             delay(delay)
-            newWhichKeyBalloon.show(target, Balloon.Position.above)
-            currentBalloon = newWhichKeyBalloon
+            // JBPopup.show* must be called on the Event Dispatch Thread
+            SwingUtilities.invokeLater {
+                // position the popup within the IDE frame based on the configured position
+                when (position) {
+                    PopupPosition.CENTER -> newPopup.showInCenterOf(ideFrame.rootPane)
+                    PopupPosition.TOP, PopupPosition.BOTTOM -> {
+                        val rootPane = ideFrame.rootPane
+                        val locationOnScreen = rootPane.locationOnScreen
+                        val popupSize = editorPane.preferredSize
+                        // horizontally centered
+                        val x = locationOnScreen.x + (rootPane.width - popupSize.width) / 2
+                        // vertically at the top or bottom edge
+                        val y = if (position == PopupPosition.TOP) {
+                            locationOnScreen.y
+                        } else {
+                            locationOnScreen.y + rootPane.height - popupSize.height
+                        }
+                        newPopup.showInScreenCoordinates(rootPane, Point(x, y))
+                    }
+                }
+                currentPopup = newPopup
+
+                // JBPopup has no built-in fadeout, so we use a one-shot Swing Timer
+                // to auto-cancel the popup after the configured timeout
+                if (fadeoutTime > 0) {
+                    fadeoutTimer?.stop()
+                    fadeoutTimer = Timer(fadeoutTime.toInt()) {
+                        newPopup.cancel()
+                        if (currentPopup == newPopup) {
+                            currentPopup = null
+                        }
+                        fadeoutTimer = null
+                    }.apply {
+                        isRepeats = false
+                        start()
+                    }
+                }
+            }
         }
     }
 
@@ -181,4 +254,14 @@ enum class SortOption {
     BY_KEY_PREFIX_FIRST,
     BY_KEY_PREFIX_LAST,
     BY_DESCRIPTION
+}
+
+/**
+ * Available positions for the Which-Key popup within the IDE frame.
+ * Configurable via `g:WhichKey_Position` in `.ideavimrc`.
+ */
+enum class PopupPosition {
+    CENTER,
+    TOP,
+    BOTTOM
 }
